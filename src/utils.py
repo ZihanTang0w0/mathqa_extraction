@@ -59,3 +59,12 @@ def convert_to_markdown(text):
     # Ensuring correct newlines for Markdown sections
     markdown_text = markdown_text.strip()  # Remove leading/trailing whitespace
     return markdown_text
+
+def flatten(lst):
+    flat_list = []
+    for item in lst:
+        if isinstance(item, list):
+            flat_list.extend(flatten(item))
+        else:
+            flat_list.append(item)
+    return flat_list

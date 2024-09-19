@@ -8,21 +8,21 @@ import torch
 from abc import ABC
 from model_utils import get_model, get_model_path
 from datasets import load_dataset
-from preprocessing import preprocess_dataset
+from preprocessing import PreProcessor
 from utils import *
-
+import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "5,6,7"
 
 HOME_DIR = "/home/zhtang/mathqa_extraction"
 SYSTEM_PROMPT = "You are an expert in identifying and extracting math question-answer pairs from unstructured text. Your task is to:\n1. Identify math questions in the provided text and extract them.\n2. Locate and extract their corresponding answers, if they exist in the text.\n3. If no answer is found, you should still extract the question.\n4. For each extracted question and answer, return the row number ranges where they are found in the text. Use the following format: Output Format: Question: Extracted question text\n- Found in rows: X to Y\nAnswer: Extracted answer text (or Answer not found if it does not exist)\n- Found in rows: A to B (or indicate if the answer is missing)"
 
-
 class ExtractionPipeline(ABC):
     def __init__(
             self, 
             model_path=None, 
-            output_path=None
+            output_path=None,
+            pre_processor: PreProcessor=None
         ):
         if model_path is not None:
             self.gen_pipeline = transformers.pipeline(
@@ -34,14 +34,22 @@ class ExtractionPipeline(ABC):
             self.gen_pipeline.tokenizer.pad_token_id = self.gen_pipeline.tokenizer.eos_token_id
             self.gen_pipeline.tokenizer.padding_side = 'left'
         self.output_path = output_path
+        if pre_processor is None:
+            self.pre_processor = PreProcessor(tokenizer_path = model_path)
+        else:
+            self.pre_processor = pre_processor
     
-    def pre_process(self, dataset, max_truncate_len=2048*8) -> List[str]:
+    def pre_process(self, dataset, max_segment_len=2048*8, mode="by_token") -> List[str]:
         """
         Add row numbers to contents in the dataset and truncate them by `max_truncate_len`
         Return a list of truncated texts in string
         """
-        return preprocess_dataset(dataset, max_truncate_len=max_truncate_len)
+        return self.pre_processor.process_dataset(dataset, max_segment_len=max_segment_len, mode=mode)
     
+    def pre_process_and_cache(self, dataset, max_segment_len=2048*8, mode="by_token"):
+        pass
+        
+        
     def text_to_message(self, text):
         return [
                     {"role": "system", 
@@ -83,28 +91,31 @@ class ExtractionPipeline(ABC):
         
         write_to_jsonl(res, output_path)
             
-    def end2end_extract(self, dataset, batchsize=8, output_path=None):
-        #preprocess dataset
-        text_lst = preprocess_dataset(dataset)
-        messages = self.batch_get_messages(text_lst)
+    def end2end_extract(self, dataset, batchsize=8, output_path=None, max_segment_len=2048, mode="by_token"):
+        # 1. preprocess dataset
+        print(f'preprocessing dataset...')
+        text_lst = self.pre_process(dataset, max_segment_len=max_segment_len, mode=mode)
+        text_lst = flatten(text_lst)
         
         #batch generate
-        generated = self.gen_pipeline(
-            messages,
-            batch_size=batchsize,
-            max_new_tokens=2048,
-            do_sample=False,
-            pad_token_id=self.gen_pipeline.tokenizer.eos_token_id
-        )
-        
-        #save outputs
         if output_path is None:
             if self.output_path is None:
                 output_path = f"{HOME_DIR}/output_extracted_qa_data.jsonl"
             else:
                 output_path = self.output_path
-        self.save_generated(generated, output_path)
         
+        with open(output_path, 'a') as file:       
+            for text in tqdm(text_lst):
+                messages = self.text_to_message(text)
+                generated = self.gen_pipeline(
+                                    messages,
+                                    max_new_tokens=2048,
+                                    do_sample=False,
+                                )[0]["generated_text"]
+                # save output
+                file.write(str(generated))
+                file.write("\n")
+     
 if __name__ == "__main__":
     model_name = "Llama-3.1-70B-Instruct"
     model_path = get_model_path(model_name)
@@ -113,21 +124,14 @@ if __name__ == "__main__":
     owmath_homedir = '/data2/zhtang/from_hf/open_web_math'
     assert(os.path.exists(owmath_homedir))
     data_filelist = [os.path.join(owmath_homedir, shard) for shard in os.listdir(owmath_homedir)]
-    
-    # print(data_filelist[0])
-    owmath_ds = load_dataset('parquet', data_files=data_filelist[0], split="train")
-    
-    # test dataset
-    test_ds = owmath_ds.select(range(0, 2))
 
+    owmath_ds = load_dataset('parquet', data_files=data_filelist[0], split="train").shuffle(100).select(range(1000))
+    
     # pipe
     pipeline = ExtractionPipeline(
-        model_path=None,
-        output_path=f"{HOME_DIR}/output/output_extracted_qa_data_1.jsonl"
+        model_path=model_path,
+        output_path=f"{HOME_DIR}/output/output_extracted_qa_data_1.jsonl",
+        pre_processor=PreProcessor(tokenizer_path = model_path)
     )
     
-    processed_data = pipeline.pre_process(test_ds)
-    md_data = [convert_to_markdown(text) for text in processed_data]
-    write_to_jsonl(processed_data, pipeline.output_path)
-    
-    # pipeline.end2end_extract(test_ds, batchsize=2)
+    pipeline.end2end_extract(owmath_ds, max_segment_len=2048, mode="by_token")

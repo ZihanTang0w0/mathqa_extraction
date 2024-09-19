@@ -6,17 +6,22 @@ from abc import ABC
 from typing import List, Union
 from transformers import AutoTokenizer
 from model_utils import get_model, get_model_path
+from tqdm import tqdm
 import re
 
 class PreProcessor(ABC):
     def __init__(self, tokenizer_path=None):
+        """
+        Args:
+            tokenizer_path (str, optional): path to the tokenizer, if given, will load the tokenizer, otherwise will not load a tokenizer. Defaults to None.
+        """
         self.tokenizer = None
         if tokenizer_path is not None:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         
-    def truncate_by_letter(self, text: str, max_truncate_len: int=2048*8):
+    def segment_by_letter(self, text: str, max_segment_len: int=2048*8):
         """
-        First truncate lines that exceed `max_truncate_length`, then add row numbers to the beginning of each line in the given text.
+        First segment lines that exceed `max_segment_length`, then add row numbers to the beginning of each line in the given text.
 
         Args:
             text (str): text in str 
@@ -28,16 +33,16 @@ class PreProcessor(ABC):
         # assuming lines are splitted by one of the following patterns: double spaces or \n
         lines = text.replace('  ', '\n').split('\n')
         
-        line_truncates = []
+        line_segments = []
         for line in lines:
-            truncated_line = [line[i:i+max_truncate_len] for i in range(0, len(line), max_truncate_len)]
-            line_truncates.extend(truncated_line)
+            segmentd_line = [line[i:i+max_segment_len] for i in range(0, len(line), max_segment_len)]
+            line_segments.extend(segmentd_line)
         
-        # combine lines by `max_truncate_len`
+        # combine lines by `max_segment_len`
         combined_lines = []
         current_combination = ""
-        max_combine_len = max(max([len(line) for line in line_truncates]), max_truncate_len)
-        for line in line_truncates:
+        max_combine_len = max(max([len(line) for line in line_segments]), max_segment_len)
+        for line in line_segments:
             if len(current_combination) + len(line) + (1 if current_combination else 0) > max_combine_len:
                 combined_lines.append(current_combination)
                 current_combination = line
@@ -52,41 +57,101 @@ class PreProcessor(ABC):
     
         return combined_lines
     
-    def truncate_by_token(self, text: str, max_truncate_len: int=2048) -> List[str]:
-        # strip all the spaces before and after \n, assuming lines are splitted by one of the following patterns: double spaces or \n
+    def segment_by_token(self, text: str, max_segment_len: int=2048) -> List[str]:
+        """
+        Segment the given text by max_segment_len tokens.
+
+        1. First strip all the spaces before and after \n, assuming lines are splitted by one of the following patterns: double spaces or \n.
+        2. Segment each line by max_segment_len, then combine lines sequentially of which the lengths sum up to max_segment_len.
+        3. Decode and return the segmented text.
+
+        Args:
+            text (str): text in str
+            max_segment_len (int, optional): the maximum length of each segment. Defaults to 2048.
+
+        Returns:
+            List[str]: the segmented text.
+        """
+        # 1. strip all the spaces before and after \n, assuming lines are splitted by one of the following patterns: double spaces or \n
         text.replace('  ', '\n')
         text = re.sub(r'\s*\n\s*', '\n', text)
+        lines = [splitted_text + '\n' for i, splitted_text in enumerate(text.split('\n'))]
         
-        text_ids = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=max_truncate_len
-        )
-        decoded_text_lst = self.tokenizer.decode(text_ids["input_ids"])
-        print(decoded_text_lst)
-
+        # text_ids: List[List[int]]
+        text_ids = self.tokenizer(lines)["input_ids"]
         
-        return decoded_text_lst
+        # 2. segment each line by max_segment_len, then combine lines sequentially of which the lengths sum up to max_segment_len
+        # segment
+        segmented_ids = []
+        for i, line in enumerate(text_ids):
+            line_segmented = [line[i:i+max_segment_len] for i in range(0, len(line), max_segment_len+1)]
+            segmented_ids.extend(line_segmented)
+        
+        # combine
+        combined_lines = []
+        current_combination = []
+        max_combine_len = max(max([len(line) for line in segmented_ids]), max_segment_len+1)
+        
+        for i, line in enumerate(segmented_ids):
+            if len(line) + len(current_combination) + (1 if current_combination else 0) > max_combine_len:
+                combined_lines.append(current_combination)
+                current_combination = line
+            else:
+                if current_combination:
+                    line = line[1:] # add \n to the beginning of the line
+                current_combination.extend(line)
+                
+                    
+        
+        if current_combination:
+            combined_lines.append(current_combination)
+        
+        # 3. decode and return
+        return [self.tokenizer.decode(combined_line[1:]) for combined_line in combined_lines] 
     
     def add_row_numbers(self, text: str):
+        """
+        Add row numbers to the given text.
+
+        The input text is first split by \n, then each line is striped and numbered with [1], [2], [3], ... respectively.
+        The last line is ignored in the numbering process.
+
+        Args:
+            text (str): the input text
+
+        Returns:
+            str: the input text with row numbers added
+        """
         lines = text.replace('  ', '\n').split('\n')
-        numbered_lines = [f"[{i+1}] {line.strip()}" for i, line in enumerate(lines)]
+        numbered_lines = [f"[{i+1}] {line.strip()}" for i, line in enumerate(lines) if i != len(lines)-1]
         return '\n'.join(numbered_lines)
 
-
-    def process_dataset(self, dataset, max_truncate_len: int=2048, mode="by_letter") -> List[str]:
+    def process_dataset(self, dataset, max_segment_len: int=2048, mode="by_token") -> List[List[str]]:
+        """
+        Process a dataset by segmenting each example's text into segments of at most `max_segment_len` length.
+        The segmentation is done either by letter or by token, depending on the `mode` argument.
+        
+        Args:
+            dataset (List[Dict[str, str]]): the input dataset
+            max_segment_len (int): the maximum length of each segment
+            mode (str): either "by_letter" or "by_token", indicating how to segment the text
+        
+        Returns:
+            List[List[str]]: the processed dataset, where each inner list contains the segmented text
+        """
         res = []
-        for example in dataset:
+        for example in tqdm(dataset):
             text = example["text"]
             if mode == "by_letter":
-                truncates = self.truncate_by_letter(text, max_truncate_len=max_truncate_len)
+                segments = self.segment_by_letter(text, max_segment_len=max_segment_len)
             elif mode == "by_token":
-                truncates = self.truncate_by_token(text, max_truncate_len=max_truncate_len)
+                segments = self.segment_by_token(text, max_segment_len=max_segment_len)
             else:
-                raise ValueError("Invalid truncate mode")
+                raise ValueError("Invalid segment mode")
+            
             # add row numbers
-            truncates = [self.add_row_numbers(text) for text in truncates]
-            res.extend(truncates)
+            segments = [self.add_row_numbers(text) for text in segments]
+            res.append(segments)
         return res
     
     
@@ -101,8 +166,11 @@ if __name__ == '__main__':
     model_name = "Llama-3.1-70B-Instruct"
     preprocessor = PreProcessor(get_model_path(model_name))
     
-    processed_dataset = preprocessor.process_dataset(test_ds, max_truncate_len=10, mode="by_token")
+    print(test_ds[0]['text'])
+    processed_dataset = preprocessor.process_dataset(test_ds, max_segment_len=2048, mode="by_token")
+    
     print(processed_dataset[0])
     from utils import *
     write_to_jsonl(processed_dataset, "/home/zhtang/mathqa_extraction/output/test.txt")
+    
     
